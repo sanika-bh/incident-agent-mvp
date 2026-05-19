@@ -1,0 +1,422 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+import redis.asyncio as redis
+import structlog
+from redis.exceptions import ResponseError
+
+from agent.remediation import plan_remediation
+from agent.tools import request_slack_approval_stub, wait_for_slack_approval_stub
+from agent.triage import run_triage
+from interface.slack_bot import post_incident_context_alert
+from shared.config import settings
+from shared.debug_log import debug_log
+from shared.demo_triage import demo_slack_fields, presented_user_snapshot, scenario_key_from_alert
+from shared.incident_history import (
+    close_incident_history_pool,
+    init_incident_history_pool,
+    insert_incident_log_safe,
+    list_similar_scenario_safe,
+)
+from shared.models import Alert, Incident, RemediationPlan, TriageResult
+from shared.timeline import append_timeline_event
+
+
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+)
+logger = structlog.get_logger()
+
+
+STREAM_NAME = "alerts:incoming"
+CONSUMER_GROUP = os.getenv("AGENT_CONSUMER_GROUP", "incident-agent")
+CONSUMER_NAME = os.getenv("AGENT_CONSUMER_NAME", "incident-agent-consumer")
+
+
+def _as_str(v: Any) -> str:
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    return str(v)
+
+
+def _parse_timestamp(s: Any) -> datetime:
+    if isinstance(s, datetime):
+        return s
+    dt = datetime.fromisoformat(_as_str(s))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _alert_from_stream_message(fields: dict[str, Any]) -> Alert:
+    labels_val = fields.get("labels") or {}
+    if isinstance(labels_val, str):
+        labels_dict = json.loads(labels_val)
+    elif isinstance(labels_val, bytes):
+        labels_dict = json.loads(labels_val.decode("utf-8"))
+    else:
+        labels_dict = dict(labels_val)
+
+    return Alert(
+        source=_as_str(fields["source"]),
+        service=_as_str(fields["service"]),
+        alert_name=_as_str(fields["alert_name"]),
+        timestamp=_parse_timestamp(fields["timestamp"]),
+        severity=_as_str(fields["severity"]),
+        labels={str(k): str(v) for k, v in labels_dict.items()},
+        fingerprint=_as_str(fields["fingerprint"]),
+    )
+
+
+async def ensure_consumer_group(*, redis_client: redis.Redis) -> None:
+    try:
+        await redis_client.xgroup_create(
+            STREAM_NAME,
+            CONSUMER_GROUP,
+            id="$",
+            mkstream=True,
+        )
+    except ResponseError as e:
+        # Redis uses BUSYGROUP when the group already exists.
+        if "BUSYGROUP" not in str(e):
+            raise
+
+
+def _similar_incidents_text(similar: dict[str, Any] | None) -> str | None:
+    if not similar:
+        return None
+    count = similar.get("count")
+    last_at = similar.get("last_at")
+    last_action = similar.get("last_action") or "unknown"
+    return (
+        f"Similar incidents (same scenario + service): {count} in history. "
+        f"Most recent at {last_at}; last recorded action/outcome: {last_action}."
+    )
+
+
+async def _persist_incident_history(
+    *,
+    alert: Alert,
+    incident: Incident,
+    triage_result: TriageResult,
+    remediation_plan: RemediationPlan | None,
+    similar: dict[str, Any] | None,
+    demo_fields: dict[str, Any] | None,
+) -> None:
+    presented = presented_user_snapshot(
+        alert,
+        triage_result,
+        demo_fields=demo_fields,
+        similar=similar,
+    )
+    if remediation_plan is not None:
+        presented["remediation"] = remediation_plan.model_dump()
+
+    await insert_incident_log_safe(
+        incident_fingerprint=alert.fingerprint,
+        scenario=scenario_key_from_alert(alert),
+        service=alert.service,
+        alert_name=alert.alert_name,
+        severity=alert.severity,
+        triage=triage_result.model_dump(),
+        remediation=(remediation_plan.model_dump() if remediation_plan is not None else {}),
+        presented_to_user=presented,
+        outcome=incident.status,
+        action_taken=incident.status,
+    )
+
+
+async def run_incident(alert: Alert, *, redis_client: redis.Redis) -> Incident:
+    incident_id = alert.fingerprint
+    # region agent log
+    debug_log(
+        run_id="pre-fix",
+        hypothesis_id="H3",
+        location="agent.loop:run_incident",
+        message="agent started incident",
+        data={"incident_id": incident_id, "service": alert.service, "severity": alert.severity},
+    )
+    # endregion
+    await append_timeline_event(
+        redis_client,
+        incident_id=incident_id,
+        stage="agent.started",
+        status="processing",
+        summary="Agent started incident processing",
+        service=alert.service,
+        source=alert.source,
+        alert_name=alert.alert_name,
+        severity=alert.severity,
+    )
+
+    triage_result = await run_triage(alert)
+    # region agent log
+    debug_log(
+        run_id="pre-fix",
+        hypothesis_id="H3",
+        location="agent.loop:run_incident",
+        message="agent triage completed",
+        data={"incident_id": incident_id, "risk_level": triage_result.risk_level},
+    )
+    # endregion
+    scenario_key = scenario_key_from_alert(alert)
+    similar = await list_similar_scenario_safe(scenario=scenario_key, service=alert.service)
+    demo_fields = demo_slack_fields(alert)
+    dashboard_url = f"{settings.DEMO_BASE_URL.rstrip('/')}/#incidents"
+
+    await post_incident_context_alert(
+        incident_id=incident_id,
+        triage=triage_result,
+        plan=None,
+        similar_incidents_text=_similar_incidents_text(similar),
+        demo_fields=demo_fields,
+        dashboard_url=dashboard_url,
+    )
+
+    await append_timeline_event(
+        redis_client,
+        incident_id=incident_id,
+        stage="agent.triaged",
+        status="triaged",
+        summary=triage_result.summary,
+        service=alert.service,
+        source=alert.source,
+        alert_name=alert.alert_name,
+        severity=triage_result.severity,
+        metadata={
+            "risk_level": triage_result.risk_level,
+            "runbooks": triage_result.recommended_runbooks,
+            "similar_incidents": similar,
+            "scenario": scenario_key,
+        },
+    )
+    remediation_plan = await plan_remediation(alert, triage_result)
+    await append_timeline_event(
+        redis_client,
+        incident_id=incident_id,
+        stage="agent.planned",
+        status="planned",
+        summary="Remediation plan created",
+        service=alert.service,
+        source=alert.source,
+        alert_name=alert.alert_name,
+        severity=alert.severity,
+        metadata={
+            "approval_required": remediation_plan.approval_required,
+            "step_titles": [step.title for step in remediation_plan.steps],
+        },
+    )
+
+    incident = Incident(
+        incident_id=incident_id,
+        alert_fingerprint=alert.fingerprint,
+        status="new",
+        triage=triage_result,
+        remediation=remediation_plan,
+    )
+
+    # Risk gating: pause for approval if the plan says so.
+    if remediation_plan.approval_required:
+        incident.status = "awaiting_approval"
+
+        logger.info(
+            "approval required (awaiting)",
+            incident_id=incident_id,
+            risk_level=remediation_plan.risk_level,
+        )
+        await append_timeline_event(
+            redis_client,
+            incident_id=incident_id,
+            stage="agent.awaiting_approval",
+            status="awaiting_approval",
+            summary="Agent paused for Slack approval",
+            service=alert.service,
+            source=alert.source,
+            alert_name=alert.alert_name,
+            severity=alert.severity,
+            metadata={"risk_level": remediation_plan.risk_level},
+        )
+
+        await request_slack_approval_stub(
+            redis_client=redis_client,
+            incident_id=incident_id,
+            triage=triage_result,
+            plan=remediation_plan,
+        )
+
+        approved = await wait_for_slack_approval_stub(
+            redis_client=redis_client,
+            incident_id=incident_id,
+        )
+
+        incident.status = "remediated" if approved else "failed"
+        await append_timeline_event(
+            redis_client,
+            incident_id=incident_id,
+            stage="agent.completed",
+            status=incident.status,
+            summary="Approval flow finished",
+            service=alert.service,
+            source=alert.source,
+            alert_name=alert.alert_name,
+            severity=alert.severity,
+            metadata={"approved": approved},
+        )
+        await _persist_incident_history(
+            alert=alert,
+            incident=incident,
+            triage_result=triage_result,
+            remediation_plan=remediation_plan,
+            similar=similar,
+            demo_fields=demo_fields,
+        )
+        return incident
+
+    # Execute remediation steps as stubs.
+    for step in remediation_plan.steps:
+        if step.requires_approval:
+            # Should generally be handled by `approval_required`, but keep it safe.
+            incident.status = "awaiting_approval"
+            await request_slack_approval_stub(
+                redis_client=redis_client,
+                incident_id=incident_id,
+                triage=triage_result,
+                plan=remediation_plan,
+            )
+            approved = await wait_for_slack_approval_stub(redis_client=redis_client, incident_id=incident_id)
+            if not approved:
+                incident.status = "failed"
+                await _persist_incident_history(
+                    alert=alert,
+                    incident=incident,
+                    triage_result=triage_result,
+                    remediation_plan=remediation_plan,
+                    similar=similar,
+                    demo_fields=demo_fields,
+                )
+                return incident
+
+        logger.info(
+            "remediation step executed (stub)",
+            incident_id=incident_id,
+            step_title=step.title,
+            step_risk_level=step.risk_level,
+        )
+        await append_timeline_event(
+            redis_client,
+            incident_id=incident_id,
+            stage="agent.remediation_step",
+            status="executing",
+            summary=f"Executed remediation step: {step.title}",
+            service=alert.service,
+            source=alert.source,
+            alert_name=alert.alert_name,
+            severity=alert.severity,
+            metadata={"risk_level": step.risk_level},
+        )
+
+        # MVP: no mutation.
+        await asyncio.sleep(0)
+
+    incident.status = "remediated"
+    # region agent log
+    debug_log(
+        run_id="pre-fix",
+        hypothesis_id="H3",
+        location="agent.loop:run_incident",
+        message="agent incident completed",
+        data={"incident_id": incident_id, "status": incident.status},
+    )
+    # endregion
+    await append_timeline_event(
+        redis_client,
+        incident_id=incident_id,
+        stage="agent.completed",
+        status=incident.status,
+        summary="Incident remediation flow completed",
+        service=alert.service,
+        source=alert.source,
+        alert_name=alert.alert_name,
+        severity=alert.severity,
+    )
+    await _persist_incident_history(
+        alert=alert,
+        incident=incident,
+        triage_result=triage_result,
+        remediation_plan=remediation_plan,
+        similar=similar,
+        demo_fields=demo_fields,
+    )
+    return incident
+
+
+async def consume_stream_forever(*, redis_client: redis.Redis) -> None:
+    await ensure_consumer_group(redis_client=redis_client)
+
+    while True:
+        results = await redis_client.xreadgroup(
+            CONSUMER_GROUP,
+            CONSUMER_NAME,
+            streams={STREAM_NAME: ">"},
+            count=1,
+            block=5000,
+        )
+
+        if not results:
+            continue
+
+        for _stream_name, messages in results:
+            for message_id, fields in messages:
+                try:
+                    alert = _alert_from_stream_message(fields)
+                    await run_incident(alert, redis_client=redis_client)
+                except Exception:
+                    logger.exception(
+                        "incident processing failed",
+                        message_id=_as_str(message_id),
+                        stream=STREAM_NAME,
+                    )
+                finally:
+                    # Ack so we don't repeatedly reprocess.
+                    await redis_client.xack(STREAM_NAME, CONSUMER_GROUP, message_id)
+
+
+async def main() -> None:
+    # region agent log
+    debug_log(
+        run_id="pre-fix",
+        hypothesis_id="H3",
+        location="agent.loop:main",
+        message="agent main started",
+        data={"redis_url_configured": bool(settings.REDIS_URL)},
+    )
+    # endregion
+    try:
+        await init_incident_history_pool()
+    except Exception:
+        logger.exception("incident history pool init failed; continuing without DB persistence")
+
+    redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+    try:
+        await consume_stream_forever(redis_client=redis_client)
+    finally:
+        await redis_client.close()
+        await close_incident_history_pool()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
